@@ -18,13 +18,15 @@ Hardware
 
 Waveshare ESP32-S3-Touch-AMOLED-2.41 (SH8601 QSPI display, 600×450)
 Single-cell LiPo battery (2000–3000 mAh recommended for a full night)
-A 3D-printed stand/enclosure (STLs included, if you add them)
+A 3D-printed stand/enclosure (STLs included)
 
 Software requirements
 
 N.I.N.A. with the Advanced API plugin (v2.2.x), API on port 1888
 Arduino IDE / arduino-cli with ESP32 board support
 Libraries: LVGL 8.3.x, ArduinoJson v5
+
+Or you can download precompiled bin file and flash it with https://espressif.github.io/esptool-js/ at 0x0000 address, baud rate 115200 
 
 What's NOT working
 1. Screen brightness adjstments
