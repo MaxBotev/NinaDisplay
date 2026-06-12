@@ -28,6 +28,3 @@ Libraries: LVGL 8.3.x, ArduinoJson v5
 
 Or you can download precompiled bin file and flash it with https://espressif.github.io/esptool-js/ at 0x0000 address, baud rate 115200 
 
-What's NOT working
-1. Screen brightness adjstments
-2. Battery status bar doesn't work until connection to NINA API is established
