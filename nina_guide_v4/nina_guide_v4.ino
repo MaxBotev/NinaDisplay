@@ -123,6 +123,22 @@ static lv_color_t *g_canvas_buf = NULL;
 // ── Guide ring buffer ─────────────────────────────────────────────────────────
 #define MAX_PTS  600  // 10 min at 1 step/sec, 20 min at PHD2 2s cadence
 
+// ── Autofocus data ────────────────────────────────────────────────────────────
+// V-curve mirrored from NINA's AUTOFOCUS-* events (AF_MAX_PTS in nina_screens.h).
+// Defined up here so Arduino's auto-generated prototypes (inserted before the
+// first function definition) can see the type.
+struct AutofocusData {
+  int   pos[AF_MAX_PTS] = {0};
+  float hfr[AF_MAX_PTS] = {0};
+  int   count    = 0;
+  bool  running  = false;
+  int   best_pos = 0;
+  float best_hfr = 0;
+};
+static AutofocusData g_af;
+// Lock-free cadence hint for nina_task: poll every cycle while AF runs
+static volatile bool g_af_running_hint = false;
+
 // Probe a single IP — returns true if NINA Advanced API answers
 static bool nina_probe(const String &ip) {
   HTTPClient http;
@@ -287,7 +303,7 @@ struct SkyData {
 };
 static SkyData g_sky;
 
-// X-axis zoom: how many points to show. 
+// X-axis zoom: how many points to show.
 // Controlled by Slider1 (1-100). 100 = full history, 1 = most zoomed in.
 // Number of guide steps to show. 120 ≈ 5min at PHD2 2-3s cadence.
 // Slider on Screen2 adjusts this. One point = one pixel, graph grows right→left.
@@ -529,17 +545,70 @@ static void graph_draw() {
   }
 }
 
+// ── Battery refresh timer (10s, LVGL task context) ────────────────────────────
+// Runs regardless of WiFi/NINA state — nina_task can block for minutes inside
+// the host-resolve subnet scan, so battery must not depend on it. Updates all
+// bars on all screens so any screen shows a fresh value the moment it loads.
+static void batt_timer_cb(lv_timer_t *t) {
+  float v; int raw;
+  adc_get_value(&v, &raw);
+  if (v > 2.5f && v < 4.5f) {       // ignore ADC2/WiFi-clash garbage
+    g_batt_v   = v;
+    g_batt_pct = lipo_pct(v);
+    Serial.printf("[BATT] %.2fV -> %d%%\n", v, g_batt_pct);
+  }
+  screens_update_battery_bars(g_batt_pct, g_batt_v);
+}
+
 // ── UI refresh timer (200ms) ──────────────────────────────────────────────────
 static void ui_refresh_cb(lv_timer_t *t) {
   if (!g_need_update) return;
   g_need_update = false;
+
+  // ── Autofocus auto-switch ─────────────────────────────────────────────────
+  // AF starts → remember the current screen and jump to Screen1 (AF curve).
+  // AF ends → keep the result visible 15s, then return where we were.
+  AutofocusData af_snap;
+  if (xSemaphoreTake(g_data_mux, pdMS_TO_TICKS(50)) == pdTRUE) {
+    af_snap = g_af;
+    xSemaphoreGive(g_data_mux);
+  } else return;
+
+  static lv_obj_t *af_prev_screen = NULL;
+  static bool      af_was_running = false;
+  static uint32_t  af_hold_end_ms = 0;
+
+  if (af_snap.running && !af_was_running) {
+    if (lv_scr_act() != ui_Screen1) {
+      af_prev_screen = lv_scr_act();
+      lv_disp_load_scr(ui_Screen1);
+    }
+    af_hold_end_ms = 0;
+  } else if (!af_snap.running && af_was_running) {
+    af_hold_end_ms = millis() + 15000;
+  }
+  af_was_running = af_snap.running;
+
+  if (af_hold_end_ms && millis() >= af_hold_end_ms) {
+    af_hold_end_ms = 0;
+    // Only restore if the user hasn't navigated away from Screen1 manually
+    if (lv_scr_act() == ui_Screen1 && af_prev_screen)
+      lv_disp_load_scr(af_prev_screen);
+    af_prev_screen = NULL;
+  }
 
   lv_obj_t *active = lv_scr_act();
   bool on_guiding  = (active == ui_uiGraphPanel);  // Screen1
   bool on_imaging  = (active == ui_Screen3);
   bool on_focuser  = (active == ui_Screen4);
   bool on_sky      = (active == ui_Screen5);
-  screens_update_battery_bars(g_batt_pct, g_batt_v);
+  bool on_af       = (active == ui_Screen1);
+
+  // ── Autofocus screen — only when on Screen1 ───────────────────────────────
+  if (on_af) {
+    screens_update_autofocus(af_snap.pos, af_snap.hfr, af_snap.count,
+                             af_snap.running, af_snap.best_pos, af_snap.best_hfr);
+  }
   // ── Guiding labels + graph — only when on Screen1 ────────────────────────
   if (on_guiding) {
     GuiderStats snap;
@@ -922,6 +991,154 @@ static void poll_sky() {
     g_sky = d; xSemaphoreGive(g_data_mux);
   }
 }
+// ── Autofocus polling ─────────────────────────────────────────────────────────
+// NINA's Advanced API stores every WebSocket event it broadcasts; we read them
+// back over plain HTTP from /v2/api/event-history and rebuild the AF state from
+// the chronological event sequence:
+//   AUTOFOCUS-STARTING      → clear curve, running=true
+//   AUTOFOCUS-POINT-ADDED   → one V-curve point: {"HFR":3.21,"Position":12345.0}
+//   AUTOFOCUS-FINISHED/FAILED → running=false
+// The history grows all session (IMAGE-SAVE events with full stats are in
+// there too), so we stream-scan it in chunks instead of buffering the body.
+
+#define AF_SCAN_BUF     2048   // chunk buffer
+#define AF_SCAN_KEEP    512    // bytes carried over between chunks
+#define AF_SCAN_MARGIN  256    // token starts within this tail are deferred
+                               // to the next chunk (keeps each event object
+                               // fully in-buffer when we parse its values)
+
+// Scan one buffered chunk for AUTOFOCUS-* tokens whose start lies in
+// [scan_start, scan_end). Event JSON objects are tiny and key order is not
+// guaranteed, so for points we bound the value search to the enclosing {...}.
+static void af_scan_chunk(char *buf, int have, int scan_start, int scan_end,
+                          AutofocusData *d) {
+  buf[have] = '\0';
+  char *p = buf + scan_start;
+  while ((p = strstr(p, "AUTOFOCUS-")) != NULL) {
+    if ((int)(p - buf) >= scan_end) break;
+    const char *kind = p + 10;
+    if (strncmp(kind, "STARTING", 8) == 0) {
+      d->count = 0; d->running = true; d->best_pos = 0; d->best_hfr = 0;
+    } else if (strncmp(kind, "FINISHED", 8) == 0 || strncmp(kind, "FAILED", 6) == 0) {
+      d->running = false;
+    } else if (strncmp(kind, "POINT-ADDED", 11) == 0) {
+      char *os = p; while (os > buf && *os != '{') os--;
+      char *oe = p; while (*oe && *oe != '}') oe++;
+      char saved = *oe; *oe = '\0';   // bound key search to this object
+      char *k = strstr(os, "\"HFR\":");
+      float hv = k ? atof(k + 6) : -1.0f;
+      k = strstr(os, "\"Position\":");
+      float pv = k ? atof(k + 11) : -1.0f;
+      *oe = saved;
+      if (hv > 0 && pv >= 0 && d->count < AF_MAX_PTS) {
+        d->pos[d->count] = (int)(pv + 0.5f);
+        d->hfr[d->count] = hv;
+        d->count++;
+      }
+    }
+    p += 10;
+  }
+}
+
+// Stream /v2/api/event-history and rebuild AF state. Returns false on
+// HTTP/network failure (state untouched on failure).
+static bool af_scan_event_history(AutofocusData *d) {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  HTTPClient http;
+  String url = "http://" + String(g_nina_host) + ":" + String(NINA_PORT)
+             + "/v2/api/event-history";
+  http.begin(url);
+  http.setTimeout(4000);
+  int code = http.GET();
+  if (code != 200) {
+    Serial.printf("[AF] event-history -> %d\n", code);
+    http.end();
+    return false;
+  }
+
+  WiFiClient *stream = http.getStreamPtr();
+  static char buf[AF_SCAN_BUF + 1];
+  int  have       = 0;
+  int  scan_start = 0;   // 0 for first chunk, AF_SCAN_KEEP-AF_SCAN_MARGIN after
+  bool eof        = false;
+  uint32_t idle_ms = millis();
+
+  *d = AutofocusData();
+
+  while (true) {
+    if (stream->available()) {
+      int rd = stream->read((uint8_t*)buf + have, AF_SCAN_BUF - have);
+      if (rd > 0) { have += rd; idle_ms = millis(); }
+    } else if (!http.connected()) {
+      eof = true;
+    } else if (millis() - idle_ms > 3000) {
+      Serial.println("[AF] event-history stream stalled");
+      break;
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(2));
+      continue;
+    }
+
+    if (have == AF_SCAN_BUF || eof) {
+      int scan_end = eof ? have : have - AF_SCAN_MARGIN;
+      if (scan_end > scan_start)
+        af_scan_chunk(buf, have, scan_start, scan_end, d);
+      if (eof) break;
+      memmove(buf, buf + have - AF_SCAN_KEEP, AF_SCAN_KEEP);
+      have = AF_SCAN_KEEP;
+      scan_start = AF_SCAN_KEEP - AF_SCAN_MARGIN;
+    }
+  }
+  http.end();
+  return eof;
+}
+
+static void poll_autofocus() {
+  AutofocusData d;
+  if (!af_scan_event_history(&d)) return;
+
+  bool was_running = false;
+  if (xSemaphoreTake(g_data_mux, pdMS_TO_TICKS(100))) {
+    was_running = g_af.running;
+    // Carry over the best point we already resolved for a finished run
+    if (!d.running) { d.best_pos = g_af.best_pos; d.best_hfr = g_af.best_hfr; }
+    xSemaphoreGive(g_data_mux);
+  }
+
+  // Run just finished (or finished before boot): fetch the calculated best
+  // focus point from the AF report
+  if (!d.running && d.count > 0 && d.best_pos == 0) {
+    String base = "http://" + String(g_nina_host) + ":" + String(NINA_PORT) + "/v2/api";
+    String body;
+    if (http_get(base + "/equipment/focuser/last-af", body)) {
+      DynamicJsonBuffer jbuf(8192);
+      JsonObject &root = jbuf.parseObject(body);
+      if (root.success()) {
+        JsonObject &r = root["Response"];
+        d.best_pos = (int)(r["CalculatedFocusPoint"]["Position"] | 0.0f);
+        d.best_hfr = r["CalculatedFocusPoint"]["Value"] | 0.0f;
+      }
+    }
+    if (d.best_pos == 0) {
+      // Fallback: lowest measured HFR
+      float bh = 1e9f;
+      for (int i = 0; i < d.count; i++) {
+        if (d.hfr[i] < bh) { bh = d.hfr[i]; d.best_pos = d.pos[i]; d.best_hfr = bh; }
+      }
+    }
+  }
+
+  if (was_running != d.running)
+    Serial.printf("[AF] %s (%d pts)\n", d.running ? "RUNNING" : "idle", d.count);
+
+  if (xSemaphoreTake(g_data_mux, pdMS_TO_TICKS(100))) {
+    g_af = d;
+    xSemaphoreGive(g_data_mux);
+  }
+  g_af_running_hint = d.running;
+  g_need_update = true;
+}
+
 static void nina_task(void *arg) {
   Serial.println("[NINA] task started");
   int cycle = 0;
@@ -930,15 +1147,8 @@ static void nina_task(void *arg) {
   
   while (1) {
     wifi_manager_loop();
-    if (cycle % 10 == 0) {
-  float v; int raw;
-  adc_get_value(&v, &raw);
-  if (v > 2.5f && v < 4.5f) {       // ignore ADC2/WiFi-clash garbage
-    g_batt_v   = v;
-    g_batt_pct = lipo_pct(v);
-    Serial.printf("[BATT] %.2fV -> %d%%\n", v, g_batt_pct);
-  }
-}
+    // (battery handled by batt_timer_cb — an LVGL timer independent of this
+    // task, which blocks for minutes at a time during NINA host resolution)
     bool connected = (WiFi.status()==WL_CONNECTED);
 
     if (!connected && wm_ap_active) { vTaskDelay(pdMS_TO_TICKS(5)); continue; }
@@ -961,6 +1171,8 @@ static void nina_task(void *arg) {
       if (cycle % 6 == 0)  { poll_imaging();  vTaskDelay(pdMS_TO_TICKS(50)); }
       if (cycle % 10 == 0) { poll_focuser(); vTaskDelay(pdMS_TO_TICKS(50)); }
       if (cycle % 10 == 0) { poll_sky();     vTaskDelay(pdMS_TO_TICKS(50)); }
+      // AF: every cycle while a run is live (fresh curve points), 5s otherwise
+      if (g_af_running_hint || cycle % 5 == 0) { poll_autofocus(); vTaskDelay(pdMS_TO_TICKS(50)); }
     } else if (!connected) {
       inject_demo();
     }
@@ -969,10 +1181,13 @@ static void nina_task(void *arg) {
   }
 }
 
-// Set panel brightness 0-255 via SH8601 reg 0x51
+// Set panel brightness 0-255 via SH8601 reg 0x51.
+// QSPI commands must be framed as (0x02 << 24) | (reg << 8) — same wrapping
+// tx_param() does inside esp_lcd_sh8601.c; a raw 0x51 is ignored by the panel.
 static void set_brightness(uint8_t level) {
   if (!g_io_handle) return;
-  esp_lcd_panel_io_tx_param(g_io_handle, 0x51, (uint8_t[]){level}, 1);
+  esp_lcd_panel_io_tx_param(g_io_handle, (0x02UL << 24) | (0x51UL << 8),
+                            (uint8_t[]){level}, 1);
 }
 
 extern "C" void brigtnesschange(lv_event_t *e) {
@@ -1156,6 +1371,8 @@ ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel, true));
 
     screens_init();  // build imaging/focuser/sky panels
     lv_timer_create(ui_refresh_cb, 200, NULL);
+    lv_timer_create(batt_timer_cb, 10000, NULL);
+    batt_timer_cb(NULL);   // paint the boot reading on all bars right away
     lvgl_unlock();
   }
 

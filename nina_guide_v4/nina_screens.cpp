@@ -17,6 +17,7 @@
 #include "esp_heap_caps.h"
 #include "lvgl.h"
 #include "ui.h"
+#include "nina_screens.h"
 #include <Arduino.h>
 
 LV_FONT_DECLARE(ui_font_Font12);
@@ -95,14 +96,16 @@ static void apply_battery_bar(lv_obj_t *bar, lv_obj_t *label, int pct, float vol
   lv_obj_set_style_bg_color(bar, col, LV_PART_INDICATOR);
 }
 void screens_update_battery_bars(int pct, float volts) {
-  lv_obj_t *active = lv_scr_act();
-  if (active == ui_uiGraphPanel)  apply_battery_bar(ui_batbar, NULL, pct, volts);
-  else if (active == ui_Screen2) {
-    apply_battery_bar(ui_batterybar, ui_batterylabel, pct, volts);
-    apply_battery_bar(ui_batbar1, NULL, pct, volts);
-  }
-  else if (active == ui_Screen3)  apply_battery_bar(ui_batbar2, NULL, pct, volts);
-  else if (active == ui_Screen5)  apply_battery_bar(ui_batbar3, NULL, pct, volts);
+  // Update every bar, not just the active screen's: with per-screen updates a
+  // bar only refreshed when a data tick landed while that screen was shown,
+  // so screens visited between ticks kept the stale SLS default. Off-screen
+  // LVGL objects are cheap to update and repaint when their screen loads.
+  apply_battery_bar(ui_batbar,     NULL,            pct, volts);
+  apply_battery_bar(ui_batterybar, ui_batterylabel, pct, volts);
+  apply_battery_bar(ui_batbar1,    NULL,            pct, volts);
+  apply_battery_bar(ui_batbar2,    NULL,            pct, volts);
+  apply_battery_bar(ui_batbar3,    NULL,            pct, volts);
+  apply_battery_bar(ui_batbar4,    NULL,            pct, volts);
 }
 void screens_update_battery(int pct, float volts) {
   char buf[32];
@@ -356,6 +359,204 @@ static void build_imaging_screen() {
   Serial.printf("[IMG] canvas OK %dx%d\n", IGW, IGH);
 }
 
+
+// ── Autofocus V-curve (Screen1) ───────────────────────────────────────────────
+// ImagingPanel1: 593x364, padding zeroed = full size
+#define AFW       593
+#define AFH       320   // leave 44px at bottom for x-axis labels
+#define AF_YAXIS  52    // left margin for HFR Y-axis labels
+#define AF_GX     AF_YAXIS
+#define AF_GW     (AFW - AF_YAXIS - 16)
+#define AF_GH     (AFH - 20)   // top 20px for label clearance
+
+static lv_obj_t   *s_af_canvas = NULL;
+static lv_color_t *s_af_buf    = NULL;
+
+static int   s_af_pos[AF_MAX_PTS] = {0};
+static float s_af_hfr[AF_MAX_PTS] = {0};
+static int   s_af_count    = 0;
+static bool  s_af_running  = false;
+static int   s_af_best_pos = 0;
+static float s_af_best_hfr = 0;
+
+// Map HFR value to AF graph Y (high HFR = top)... inverted like hfr_to_y but
+// using the AF graph height
+static int hfr_to_y_range(float v, float mn, float mx) {
+  if (mx <= mn) mx = mn + 0.1f;
+  float norm = (v - mn) / (mx - mn);
+  return (int)((1.0f - norm) * (AF_GH - 4)) + 2;
+}
+
+static void af_graph_draw() {
+  if (!s_af_canvas || !s_af_buf) return;
+  lv_canvas_fill_bg(s_af_canvas, COL_BG, LV_OPA_COVER);
+
+  int n = s_af_count;
+
+  lv_draw_label_dsc_t ld;
+  lv_draw_label_dsc_init(&ld);
+  ld.font = &lv_font_montserrat_14;
+
+  if (n == 0) {
+    ld.color = COL_GREY;
+    ld.align = LV_TEXT_ALIGN_CENTER;
+    lv_canvas_draw_text(s_af_canvas, 0, AF_GH / 2, AFW, &ld,
+                        "Waiting for autofocus data...");
+    return;
+  }
+
+  // Sort indices by focuser position so the V-curve reads left→right
+  // (NINA measures in sweep order which may be high→low)
+  int order[AF_MAX_PTS];
+  for (int i = 0; i < n; i++) order[i] = i;
+  for (int i = 1; i < n; i++) {
+    int k = order[i], j = i - 1;
+    while (j >= 0 && s_af_pos[order[j]] > s_af_pos[k]) { order[j+1] = order[j]; j--; }
+    order[j+1] = k;
+  }
+
+  // Ranges with headroom
+  int   pmin = s_af_pos[order[0]], pmax = s_af_pos[order[n-1]];
+  float hmin = 9999, hmax = 0;
+  for (int i = 0; i < n; i++) {
+    if (s_af_hfr[i] < hmin) hmin = s_af_hfr[i];
+    if (s_af_hfr[i] > hmax) hmax = s_af_hfr[i];
+  }
+  float hpad = (hmax - hmin) * 0.15f;
+  if (hpad < 0.1f) hpad = 0.1f;
+  hmin -= hpad; hmax += hpad;
+  if (hmin < 0) hmin = 0;
+  int prange = pmax - pmin;
+  if (prange < 1) prange = 1;
+
+  // ── Grid lines (dashed, 4 rows) + left HFR labels ─────────────────────────
+  lv_draw_line_dsc_t gd;
+  lv_draw_line_dsc_init(&gd);
+  gd.color = C(0x21262D); gd.width = 1; gd.opa = LV_OPA_COVER;
+  for (int row = 0; row <= 4; row++) {
+    int y = 2 + row * (AF_GH - 4) / 4;
+    for (int x = AF_GX; x < AF_GX + AF_GW; x += 12) {
+      int x2 = x + 7; if (x2 > AF_GX + AF_GW) x2 = AF_GX + AF_GW;
+      lv_point_t pts[2] = {{(lv_coord_t)x, (lv_coord_t)y}, {(lv_coord_t)x2, (lv_coord_t)y}};
+      lv_canvas_draw_line(s_af_canvas, pts, 2, &gd);
+    }
+  }
+  ld.color = COL_HFR;
+  ld.align = LV_TEXT_ALIGN_RIGHT;
+  for (int row = 0; row <= 4; row++) {
+    int y = 2 + row * (AF_GH - 4) / 4;
+    float val = hmax - row * (hmax - hmin) / 4.0f;
+    char buf[12];
+    snprintf(buf, sizeof(buf), "%.2f", val);
+    lv_canvas_draw_text(s_af_canvas, 0, y - 8, AF_YAXIS - 4, &ld, buf);
+  }
+
+  // ── X-axis focuser-position labels (min / mid / max) ──────────────────────
+  ld.color = COL_GREY;
+  ld.align = LV_TEXT_ALIGN_CENTER;
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%d", pmin);
+  lv_canvas_draw_text(s_af_canvas, AF_GX - 30, AF_GH + 6, 60, &ld, buf);
+  snprintf(buf, sizeof(buf), "%d", (pmin + pmax) / 2);
+  lv_canvas_draw_text(s_af_canvas, AF_GX + AF_GW/2 - 30, AF_GH + 6, 60, &ld, buf);
+  snprintf(buf, sizeof(buf), "%d", pmax);
+  lv_canvas_draw_text(s_af_canvas, AF_GX + AF_GW - 30, AF_GH + 6, 60, &ld, buf);
+
+  // ── Best-focus marker (vertical amber line) ───────────────────────────────
+  if (s_af_best_pos >= pmin && s_af_best_pos <= pmax && n > 1) {
+    int bx = AF_GX + (int)((float)(s_af_best_pos - pmin) / prange * (AF_GW - 1));
+    lv_draw_line_dsc_t bd;
+    lv_draw_line_dsc_init(&bd);
+    bd.color = COL_STARS; bd.width = 1; bd.opa = LV_OPA_80;
+    lv_point_t bp[2] = {{(lv_coord_t)bx, 2}, {(lv_coord_t)bx, (lv_coord_t)(AF_GH - 2)}};
+    lv_canvas_draw_line(s_af_canvas, bp, 2, &bd);
+  }
+
+  // ── V-curve line + dot markers (green) ────────────────────────────────────
+  lv_draw_line_dsc_t hl;
+  lv_draw_line_dsc_init(&hl);
+  hl.color = COL_HFR; hl.width = 2; hl.opa = LV_OPA_COVER;
+
+  lv_draw_rect_dsc_t dot;
+  lv_draw_rect_dsc_init(&dot);
+  dot.bg_color = COL_HFR; dot.bg_opa = LV_OPA_COVER;
+  dot.border_width = 0; dot.radius = LV_RADIUS_CIRCLE;
+
+  int prevX = -1, prevY = -1;
+  for (int i = 0; i < n; i++) {
+    int idx = order[i];
+    int x = (n > 1)
+      ? AF_GX + (int)((float)(s_af_pos[idx] - pmin) / prange * (AF_GW - 1))
+      : AF_GX + AF_GW / 2;
+    int y = hfr_to_y_range(s_af_hfr[idx], hmin, hmax);
+    if (prevX >= 0) {
+      lv_point_t pp[2] = {{(lv_coord_t)prevX,(lv_coord_t)prevY},{(lv_coord_t)x,(lv_coord_t)y}};
+      lv_canvas_draw_line(s_af_canvas, pp, 2, &hl);
+    }
+    lv_canvas_draw_rect(s_af_canvas, x-3, y-3, 6, 6, &dot);
+    prevX = x; prevY = y;
+  }
+}
+
+void screens_update_autofocus(const int *pos, const float *hfr, int n,
+    bool running, int best_pos, float best_hfr)
+{
+  if (n > AF_MAX_PTS) n = AF_MAX_PTS;
+  for (int i = 0; i < n; i++) { s_af_pos[i] = pos[i]; s_af_hfr[i] = hfr[i]; }
+  s_af_count    = n;
+  s_af_running  = running;
+  s_af_best_pos = best_pos;
+  s_af_best_hfr = best_hfr;
+
+  char buf[64];
+  if (running) {
+    if (n > 0) snprintf(buf, sizeof(buf), "AF running  HFR: %.2f  (%d pts)", hfr[n-1], n);
+    else       snprintf(buf, sizeof(buf), "AF running...");
+    lv_obj_set_style_text_color(ui_hfrlabel1, COL_WARN, 0);
+  } else if (best_pos > 0) {
+    snprintf(buf, sizeof(buf), "Best: %d  HFR: %.2f", best_pos, best_hfr);
+    lv_obj_set_style_text_color(ui_hfrlabel1, COL_GOOD, 0);
+  } else if (n > 0) {
+    snprintf(buf, sizeof(buf), "Last AF: %d pts", n);
+    lv_obj_set_style_text_color(ui_hfrlabel1, COL_GREY, 0);
+  } else {
+    snprintf(buf, sizeof(buf), "HFR: --");
+    lv_obj_set_style_text_color(ui_hfrlabel1, COL_GREY, 0);
+  }
+  lv_label_set_text(ui_hfrlabel1, buf);
+
+  af_graph_draw();
+}
+
+// ── Build Autofocus screen (Screen1) ──────────────────────────────────────────
+static void build_autofocus_screen() {
+  lv_obj_set_style_bg_color(ui_Screen1, COL_BG, 0);
+
+  // Header panel like Screen3's Panel4
+  lv_obj_set_style_bg_color(ui_Panel5,     COL_PANEL, 0);
+  lv_obj_set_style_bg_opa(ui_Panel5,       LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(ui_Panel5, 0, 0);
+  lv_obj_set_style_pad_all(ui_Panel5,      0, 0);
+
+  // Graph panel — zero padding so the canvas fills it exactly
+  lv_obj_set_style_bg_color(ui_ImagingPanel1,     COL_BG, 0);
+  lv_obj_set_style_bg_opa(ui_ImagingPanel1,       LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(ui_ImagingPanel1, 0, 0);
+  lv_obj_set_style_pad_all(ui_ImagingPanel1,      0, 0);
+  lv_obj_set_style_radius(ui_ImagingPanel1,       0, 0);
+
+  s_af_buf = (lv_color_t*)heap_caps_malloc(
+    AFW * AFH * sizeof(lv_color_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!s_af_buf) { Serial.println("[AF] canvas alloc FAILED"); return; }
+
+  s_af_canvas = lv_canvas_create(ui_ImagingPanel1);
+  lv_canvas_set_buffer(s_af_canvas, s_af_buf, AFW, AFH, LV_IMG_CF_TRUE_COLOR);
+  lv_obj_set_pos(s_af_canvas, 0, 0);
+  lv_obj_set_size(s_af_canvas, AFW, AFH);
+  af_graph_draw();   // draws the "waiting" placeholder
+
+  Serial.printf("[AF] canvas OK %dx%d\n", AFW, AFH);
+}
 
 // ── Build Sky screen ──────────────────────────────────────────────────────────
 // ── Screen5 chart series ──────────────────────────────────────────────────────
@@ -650,4 +851,5 @@ void screens_init() {
   build_imaging_screen();
   build_focuser_screen();
   build_sky_screen();
+  build_autofocus_screen();
 }

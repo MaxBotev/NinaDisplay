@@ -1,9 +1,15 @@
 #pragma once
 
+// Max V-curve points mirrored from NINA AUTOFOCUS-POINT-ADDED events
+#define AF_MAX_PTS 50
+
 #ifdef __cplusplus
 extern "C++" {
 #endif
 void screens_set_sky_history(const float *hfr, const float *rms_arcsec, int n);
+// Screen1 — autofocus V-curve + hfrlabel1 status text
+void screens_update_autofocus(const int *pos, const float *hfr, int n,
+    bool running, int best_pos, float best_hfr);
 void screens_set_hfr_history(const float *hfr, const int *stars, int n);
 void screens_init();
 void screens_update_battery_bars(int pct, float volts);

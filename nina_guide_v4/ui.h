@@ -32,6 +32,7 @@ extern "C" {
 #include "ui_Screen4.h"
 #include "ui_Screen5.h"
 #include "ui_Screen6.h"
+#include "ui_Screen1.h"
 
 ///////////////////// VARIABLES ////////////////////
 
