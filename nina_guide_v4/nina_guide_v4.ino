@@ -995,107 +995,53 @@ static void poll_sky() {
 // NINA's Advanced API stores every WebSocket event it broadcasts; we read them
 // back over plain HTTP from /v2/api/event-history and rebuild the AF state from
 // the chronological event sequence:
-//   AUTOFOCUS-STARTING      → clear curve, running=true
-//   AUTOFOCUS-POINT-ADDED   → one V-curve point: {"HFR":3.21,"Position":12345.0}
+//   AUTOFOCUS-STARTING        → clear curve, running=true
+//   AUTOFOCUS-POINT-ADDED     → one V-curve point: {...,"HFR":3.21,"Position":12345}
 //   AUTOFOCUS-FINISHED/FAILED → running=false
-// The history grows all session (IMAGE-SAVE events with full stats are in
-// there too), so we stream-scan it in chunks instead of buffering the body.
+// Reuses the proven http_get() String path (same as image-history); the body
+// is small (one short line per event) so no streaming/chunking is needed.
 
-#define AF_SCAN_BUF     2048   // chunk buffer
-#define AF_SCAN_KEEP    512    // bytes carried over between chunks
-#define AF_SCAN_MARGIN  256    // token starts within this tail are deferred
-                               // to the next chunk (keeps each event object
-                               // fully in-buffer when we parse its values)
-
-// Scan one buffered chunk for AUTOFOCUS-* tokens whose start lies in
-// [scan_start, scan_end). Event JSON objects are tiny and key order is not
-// guaranteed, so for points we bound the value search to the enclosing {...}.
-static void af_scan_chunk(char *buf, int have, int scan_start, int scan_end,
-                          AutofocusData *d) {
-  buf[have] = '\0';
-  char *p = buf + scan_start;
-  while ((p = strstr(p, "AUTOFOCUS-")) != NULL) {
-    if ((int)(p - buf) >= scan_end) break;
-    const char *kind = p + 10;
+// Scan the event-history body for AUTOFOCUS-* tokens and rebuild AF state.
+// Key order inside an event object is not guaranteed, so for points we bound
+// the HFR/Position search to the enclosing {...}.
+static void af_parse_history(const String &body, AutofocusData &d) {
+  d = AutofocusData();
+  const char *s = body.c_str();
+  int from = 0;
+  while (true) {
+    int hit = body.indexOf("AUTOFOCUS-", from);
+    if (hit < 0) break;
+    from = hit + 10;
+    const char *kind = s + hit + 10;
     if (strncmp(kind, "STARTING", 8) == 0) {
-      d->count = 0; d->running = true; d->best_pos = 0; d->best_hfr = 0;
+      d.count = 0; d.running = true; d.best_pos = 0; d.best_hfr = 0;
     } else if (strncmp(kind, "FINISHED", 8) == 0 || strncmp(kind, "FAILED", 6) == 0) {
-      d->running = false;
+      d.running = false;
     } else if (strncmp(kind, "POINT-ADDED", 11) == 0) {
-      char *os = p; while (os > buf && *os != '{') os--;
-      char *oe = p; while (*oe && *oe != '}') oe++;
-      char saved = *oe; *oe = '\0';   // bound key search to this object
-      char *k = strstr(os, "\"HFR\":");
-      float hv = k ? atof(k + 6) : -1.0f;
-      k = strstr(os, "\"Position\":");
-      float pv = k ? atof(k + 11) : -1.0f;
-      *oe = saved;
-      if (hv > 0 && pv >= 0 && d->count < AF_MAX_PTS) {
-        d->pos[d->count] = (int)(pv + 0.5f);
-        d->hfr[d->count] = hv;
-        d->count++;
+      int ostart = body.lastIndexOf('{', hit);
+      int oend   = body.indexOf('}', hit);
+      if (ostart < 0 || oend < 0) continue;
+      int hk = body.indexOf("\"HFR\":", ostart);
+      int pk = body.indexOf("\"Position\":", ostart);
+      if (hk < 0 || hk > oend || pk < 0 || pk > oend) continue;
+      float hv = atof(s + hk + 6);
+      float pv = atof(s + pk + 11);
+      if (hv > 0 && pv >= 0 && d.count < AF_MAX_PTS) {
+        d.pos[d.count] = (int)(pv + 0.5f);
+        d.hfr[d.count] = hv;
+        d.count++;
       }
     }
-    p += 10;
   }
-}
-
-// Stream /v2/api/event-history and rebuild AF state. Returns false on
-// HTTP/network failure (state untouched on failure).
-static bool af_scan_event_history(AutofocusData *d) {
-  if (WiFi.status() != WL_CONNECTED) return false;
-  HTTPClient http;
-  String url = "http://" + String(g_nina_host) + ":" + String(NINA_PORT)
-             + "/v2/api/event-history";
-  http.begin(url);
-  http.setTimeout(4000);
-  int code = http.GET();
-  if (code != 200) {
-    Serial.printf("[AF] event-history -> %d\n", code);
-    http.end();
-    return false;
-  }
-
-  WiFiClient *stream = http.getStreamPtr();
-  static char buf[AF_SCAN_BUF + 1];
-  int  have       = 0;
-  int  scan_start = 0;   // 0 for first chunk, AF_SCAN_KEEP-AF_SCAN_MARGIN after
-  bool eof        = false;
-  uint32_t idle_ms = millis();
-
-  *d = AutofocusData();
-
-  while (true) {
-    if (stream->available()) {
-      int rd = stream->read((uint8_t*)buf + have, AF_SCAN_BUF - have);
-      if (rd > 0) { have += rd; idle_ms = millis(); }
-    } else if (!http.connected()) {
-      eof = true;
-    } else if (millis() - idle_ms > 3000) {
-      Serial.println("[AF] event-history stream stalled");
-      break;
-    } else {
-      vTaskDelay(pdMS_TO_TICKS(2));
-      continue;
-    }
-
-    if (have == AF_SCAN_BUF || eof) {
-      int scan_end = eof ? have : have - AF_SCAN_MARGIN;
-      if (scan_end > scan_start)
-        af_scan_chunk(buf, have, scan_start, scan_end, d);
-      if (eof) break;
-      memmove(buf, buf + have - AF_SCAN_KEEP, AF_SCAN_KEEP);
-      have = AF_SCAN_KEEP;
-      scan_start = AF_SCAN_KEEP - AF_SCAN_MARGIN;
-    }
-  }
-  http.end();
-  return eof;
 }
 
 static void poll_autofocus() {
+  String base = "http://" + String(g_nina_host) + ":" + String(NINA_PORT) + "/v2/api";
+  String body;
+  if (!http_get(base + "/event-history", body)) return;
+
   AutofocusData d;
-  if (!af_scan_event_history(&d)) return;
+  af_parse_history(body, d);
 
   bool was_running = false;
   if (xSemaphoreTake(g_data_mux, pdMS_TO_TICKS(100))) {
@@ -1108,8 +1054,6 @@ static void poll_autofocus() {
   // Run just finished (or finished before boot): fetch the calculated best
   // focus point from the AF report
   if (!d.running && d.count > 0 && d.best_pos == 0) {
-    String base = "http://" + String(g_nina_host) + ":" + String(NINA_PORT) + "/v2/api";
-    String body;
     if (http_get(base + "/equipment/focuser/last-af", body)) {
       DynamicJsonBuffer jbuf(8192);
       JsonObject &root = jbuf.parseObject(body);
@@ -1128,8 +1072,8 @@ static void poll_autofocus() {
     }
   }
 
-  if (was_running != d.running)
-    Serial.printf("[AF] %s (%d pts)\n", d.running ? "RUNNING" : "idle", d.count);
+  Serial.printf("[AF] running=%d count=%d best=%d/%.2f\n",
+                d.running, d.count, d.best_pos, d.best_hfr);
 
   if (xSemaphoreTake(g_data_mux, pdMS_TO_TICKS(100))) {
     g_af = d;
