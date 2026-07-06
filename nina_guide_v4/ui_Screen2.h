@@ -31,6 +31,10 @@ extern lv_obj_t *ui_sure2;
 extern lv_obj_t *ui_batterybar;
 extern lv_obj_t *ui_batterylabel;
 extern lv_obj_t *ui_batbar1;
+extern void ui_event_BtnRig( lv_event_t * e);
+extern lv_obj_t *ui_BtnRig;
+extern lv_obj_t *ui_LabelRig;
+extern lv_obj_t *ui_riglabel;
 // CUSTOM VARIABLES
 
 #ifdef __cplusplus

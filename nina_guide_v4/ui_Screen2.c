@@ -5,7 +5,7 @@
 
 #include "ui.h"
 
-lv_obj_t *ui_Screen2 = NULL;lv_obj_t *ui_Button2 = NULL;lv_obj_t *ui_Label3 = NULL;lv_obj_t *ui_Slider1 = NULL;lv_obj_t *ui_Label4 = NULL;lv_obj_t *ui_Slider2 = NULL;lv_obj_t *ui_Label5 = NULL;lv_obj_t *ui_Button4 = NULL;lv_obj_t *ui_Label6 = NULL;lv_obj_t *ui_sure1 = NULL;lv_obj_t *ui_sure2 = NULL;lv_obj_t *ui_batterybar = NULL;lv_obj_t *ui_batterylabel = NULL;lv_obj_t *ui_batbar1 = NULL;
+lv_obj_t *ui_Screen2 = NULL;lv_obj_t *ui_Button2 = NULL;lv_obj_t *ui_Label3 = NULL;lv_obj_t *ui_Slider1 = NULL;lv_obj_t *ui_Label4 = NULL;lv_obj_t *ui_Slider2 = NULL;lv_obj_t *ui_Label5 = NULL;lv_obj_t *ui_Button4 = NULL;lv_obj_t *ui_Label6 = NULL;lv_obj_t *ui_sure1 = NULL;lv_obj_t *ui_sure2 = NULL;lv_obj_t *ui_batterybar = NULL;lv_obj_t *ui_batterylabel = NULL;lv_obj_t *ui_batbar1 = NULL;lv_obj_t *ui_BtnRig = NULL;lv_obj_t *ui_LabelRig = NULL;lv_obj_t *ui_riglabel = NULL;
 // event funtions
 void ui_event_Button2( lv_event_t * e) {
     lv_event_code_t event_code = lv_event_get_code(e);
@@ -36,6 +36,14 @@ void ui_event_Button4( lv_event_t * e) {
 
 if ( event_code == LV_EVENT_CLICKED) {
       resetwifi( e );
+}
+}
+
+void ui_event_BtnRig( lv_event_t * e) {
+    lv_event_code_t event_code = lv_event_get_code(e);
+
+if ( event_code == LV_EVENT_CLICKED) {
+      switchrig( e );
 }
 }
 
@@ -162,7 +170,32 @@ lv_obj_set_x( ui_batbar1, 264 );
 lv_obj_set_y( ui_batbar1, -205 );
 lv_obj_set_align( ui_batbar1, LV_ALIGN_CENTER );
 
+ui_BtnRig = lv_btn_create(ui_Screen2);
+lv_obj_set_width( ui_BtnRig, 200);
+lv_obj_set_height( ui_BtnRig, 44);
+lv_obj_set_x( ui_BtnRig, -140 );
+lv_obj_set_y( ui_BtnRig, 134 );
+lv_obj_set_align( ui_BtnRig, LV_ALIGN_CENTER );
+lv_obj_add_flag( ui_BtnRig, LV_OBJ_FLAG_SCROLL_ON_FOCUS );   /// Flags
+lv_obj_clear_flag( ui_BtnRig, LV_OBJ_FLAG_SCROLLABLE );    /// Flags
+
+ui_LabelRig = lv_label_create(ui_BtnRig);
+lv_obj_set_width( ui_LabelRig, LV_SIZE_CONTENT);  /// 1
+lv_obj_set_height( ui_LabelRig, LV_SIZE_CONTENT);   /// 1
+lv_obj_set_align( ui_LabelRig, LV_ALIGN_CENTER );
+lv_label_set_text(ui_LabelRig,"Switch NINA rig");
+lv_obj_set_style_text_font(ui_LabelRig, &lv_font_montserrat_16, LV_PART_MAIN| LV_STATE_DEFAULT);
+
+ui_riglabel = lv_label_create(ui_Screen2);
+lv_obj_set_width( ui_riglabel, LV_SIZE_CONTENT);  /// 1
+lv_obj_set_height( ui_riglabel, LV_SIZE_CONTENT);   /// 1
+lv_obj_set_x( ui_riglabel, 120 );
+lv_obj_set_y( ui_riglabel, 134 );
+lv_obj_set_align( ui_riglabel, LV_ALIGN_CENTER );
+lv_label_set_text(ui_riglabel,"Rig: --");
+
 lv_obj_add_event_cb(ui_Button2, ui_event_Button2, LV_EVENT_ALL, NULL);
+lv_obj_add_event_cb(ui_BtnRig, ui_event_BtnRig, LV_EVENT_ALL, NULL);
 lv_obj_add_event_cb(ui_Slider1, ui_event_Slider1, LV_EVENT_ALL, NULL);
 lv_obj_add_event_cb(ui_Slider2, ui_event_Slider2, LV_EVENT_ALL, NULL);
 lv_obj_add_event_cb(ui_Button4, ui_event_Button4, LV_EVENT_ALL, NULL);
@@ -188,5 +221,8 @@ ui_sure2= NULL;
 ui_batterybar= NULL;
 ui_batterylabel= NULL;
 ui_batbar1= NULL;
+ui_BtnRig= NULL;
+ui_LabelRig= NULL;
+ui_riglabel= NULL;
 
 }

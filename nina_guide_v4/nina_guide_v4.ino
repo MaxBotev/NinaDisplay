@@ -1083,6 +1083,83 @@ static void poll_autofocus() {
   g_need_update = true;
 }
 
+// ── Rig switching ─────────────────────────────────────────────────────────────
+// The Screen2 "Switch NINA rig" button sets g_rig_switch_req; nina_task does the
+// actual sweep (it takes tens of seconds and must not run in LVGL context).
+#define RIG_MAX 5
+static volatile bool g_rig_switch_req = false;
+
+// Update the Screen2 status label from nina_task context (needs the LVGL lock)
+static void rig_set_status(const char *msg) {
+  if (lvgl_lock(200)) {
+    if (ui_riglabel) lv_label_set_text(ui_riglabel, msg);
+    lvgl_unlock();
+  }
+}
+
+// Sweep the /24 subnet and collect every responding NINA host (up to max_rigs)
+static int nina_scan_all(String rigs[], int max_rigs) {
+  IPAddress local = WiFi.localIP();
+  if (local[0] == 0) return 0;
+  String prefix = String(local[0]) + "." + String(local[1]) + "." + String(local[2]) + ".";
+  Serial.printf("[RIG] sweeping %s0/24 for all NINA hosts...\n", prefix.c_str());
+
+  int found = 0;
+  for (int host = 1; host <= 254 && found < max_rigs; host++) {
+    if (host == local[3]) continue;
+    String ip = prefix + String(host);
+    if (nina_probe_fast(ip)) {
+      Serial.printf("[RIG] found NINA at %s\n", ip.c_str());
+      rigs[found++] = ip;
+    }
+    if (host % 20 == 0) {
+      char msg[48];
+      snprintf(msg, sizeof(msg), "Scanning .%d (%d found)", host, found);
+      rig_set_status(msg);
+      vTaskDelay(pdMS_TO_TICKS(1));
+    }
+  }
+  Serial.printf("[RIG] sweep done: %d rig(s)\n", found);
+  return found;
+}
+
+// Find all rigs, switch to the one after the current (wraps around), persist it,
+// and clear all mirrored data so the graphs restart clean on the new rig.
+static void rig_switch_next() {
+  rig_set_status("Scanning for rigs...");
+  String rigs[RIG_MAX];
+  int n = nina_scan_all(rigs, RIG_MAX);
+
+  if (n == 0) { rig_set_status("No NINA rig found"); return; }
+
+  int cur = -1;
+  for (int i = 0; i < n; i++)
+    if (rigs[i] == String(g_nina_host)) cur = i;
+  String next = rigs[(cur + 1) % n];   // cur==-1 (current gone) → first found
+
+  if (next == String(g_nina_host)) { rig_set_status("Only one rig found"); return; }
+
+  strncpy(g_nina_host, next.c_str(), sizeof(g_nina_host)-1);
+  g_nina_host[sizeof(g_nina_host)-1] = 0;
+  wm_save_nina_ip(next);
+
+  if (xSemaphoreTake(g_data_mux, pdMS_TO_TICKS(500))) {
+    g_head = 0; g_count = 0;
+    g_stats   = GuiderStats();
+    g_imaging = ImagingData();
+    g_focuser = FocuserData();
+    g_sky     = SkyData();
+    g_af      = AutofocusData();
+    xSemaphoreGive(g_data_mux);
+  }
+
+  char msg[32];
+  snprintf(msg, sizeof(msg), "Rig: %s", g_nina_host);
+  rig_set_status(msg);
+  Serial.printf("[RIG] switched to %s\n", g_nina_host);
+  g_need_update = true;
+}
+
 static void nina_task(void *arg) {
   Serial.println("[NINA] task started");
   int cycle = 0;
@@ -1104,6 +1181,20 @@ static void nina_task(void *arg) {
         Serial.println("[NINA] no host — retrying in 10s");
         vTaskDelay(pdMS_TO_TICKS(10000));
         continue;
+      }
+      char msg[32];
+      snprintf(msg, sizeof(msg), "Rig: %s", g_nina_host);
+      rig_set_status(msg);
+    }
+
+    // Rig-switch button pressed on Screen2 → rescan and hop to the next rig
+    if (g_rig_switch_req) {
+      g_rig_switch_req = false;
+      if (connected) {
+        rig_switch_next();
+        host_resolved = (strlen(g_nina_host) > 0);
+      } else {
+        rig_set_status("WiFi not connected");
       }
     }
 
@@ -1336,6 +1427,18 @@ ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel, true));
   Serial.println("[SETUP] nina_task create returned");
   ESP_LOGI(TAG,"Setup done");
 }
+// Screen2 "Switch NINA rig" button. Runs in LVGL context, so only flag the
+// request — nina_task performs the (slow) subnet sweep.
+extern "C" void switchrig(lv_event_t *e) {
+  if (WiFi.status() != WL_CONNECTED) {
+    if (ui_riglabel) lv_label_set_text(ui_riglabel, "WiFi not connected");
+    return;
+  }
+  if (ui_riglabel) lv_label_set_text(ui_riglabel, "Scan queued...");
+  g_rig_switch_req = true;
+  Serial.println("[RIG] switch requested from Screen2");
+}
+
 extern "C" void resetwifi(lv_event_t *e) {
   if (!lv_obj_has_state(ui_sure1, LV_STATE_CHECKED) ||
       !lv_obj_has_state(ui_sure2, LV_STATE_CHECKED)) {

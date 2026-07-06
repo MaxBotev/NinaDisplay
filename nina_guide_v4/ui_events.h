@@ -13,6 +13,7 @@ extern "C" {
 void xscalechange(lv_event_t * e);
 void brigtnesschange(lv_event_t * e);
 void resetwifi(lv_event_t * e);
+void switchrig(lv_event_t * e);
 void cfbuttonpressed(lv_event_t * e);
 
 #ifdef __cplusplus
